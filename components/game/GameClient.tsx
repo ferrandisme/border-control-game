@@ -1,0 +1,1552 @@
+"use client";
+
+import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from 'react';
+
+import {
+  type AIProvider,
+  type DayBriefing,
+  type DayNews,
+  type PortraitState,
+  type PortraitCell,
+  type PortraitExpression,
+  type ScenarioState,
+  TRAVELERS_PER_DAY,
+  createInitialGameState,
+  gameReducer,
+  INITIAL_AGENT_GREETING,
+  MAX_QUESTIONS,
+  type ChatMessage,
+  type Decision,
+} from '@/lib/game-state';
+import { sanitizeDialogueText } from '@/lib/dialogue';
+import { buildDaySlotPlans, planDayCaseIds, type DaySlotPlan } from '@/lib/day-plan';
+import { getById } from '@/lib/inconsistency-catalog';
+import { DocumentType, Traveler, TravelerSchema } from '@/schemas/traveler';
+
+import { ChatPanel } from './ChatPanel';
+import { DayBriefing as DayBriefingScreen } from './DayBriefing';
+import { DecisionButtons } from './DecisionButtons';
+import { DocumentViewer } from './DocumentViewer';
+import { LoadingScreen } from './LoadingScreen';
+import { NewsScreen } from './NewsScreen';
+import { ResultReveal } from './ResultReveal';
+import { ScoreBar } from './ScoreBar';
+
+type GenerateTravelerResponse = {
+  traveler: Traveler;
+  provider_used: AIProvider;
+  text_model_used: string;
+  scenario: ScenarioState;
+  media: {
+    audioEnabled: boolean;
+    imageEnabled: boolean;
+    audioModel: string;
+    imageModel: string;
+  };
+  portrait: PortraitState;
+};
+
+type GenerateDayBriefingResponse = {
+  briefing: DayBriefing;
+};
+
+type GenerateDayNewsResponse = {
+  news: DayNews;
+};
+
+type GenerateDayPhotosResponse = {
+  photos: PortraitState[];
+};
+
+type ProcessedTravelersResponse = {
+  totalProcessedTravelers: number;
+  fallbackEstimate: number;
+};
+
+type PlannedTravelerResponse = GenerateTravelerResponse | null;
+
+const DEFAULT_PROCESSED_TRAVELERS_ESTIMATE = 137;
+
+type DaySetupPhase = 'idle' | 'roster' | 'photos' | 'finalizing';
+type TravelerLoadingStage = 'requesting' | 'receiving' | 'validated';
+
+type LoadingState = {
+  active: boolean;
+  mode: 'day_setup' | 'traveler';
+  phase: DaySetupPhase;
+  rosterCompleted: number;
+  rosterTotal: number;
+  briefingReady: boolean;
+  photosReady: boolean;
+  photosFailed: boolean;
+  detail: string | null;
+  travelerStage: TravelerLoadingStage | null;
+};
+
+type AudioResponse = {
+  status: 'disabled' | 'ready' | 'error';
+  audioUrl: string | null;
+  provider: string | null;
+  model: string | null;
+  voiceId: string | null;
+  sanitizedText?: string | null;
+};
+
+const INITIAL_LOADING_STATE: LoadingState = {
+  active: false,
+  mode: 'day_setup',
+  phase: 'idle',
+  rosterCompleted: 0,
+  rosterTotal: TRAVELERS_PER_DAY,
+  briefingReady: false,
+  photosReady: false,
+  photosFailed: false,
+  detail: null,
+  travelerStage: null,
+};
+
+const createInitialDaySetupLoadingState = (): LoadingState => ({
+  ...INITIAL_LOADING_STATE,
+  active: true,
+  mode: 'day_setup',
+  phase: 'roster',
+  rosterTotal: TRAVELERS_PER_DAY,
+  rosterCompleted: 0,
+  briefingReady: false,
+  photosReady: false,
+  photosFailed: false,
+  detail: 'El sistema fija los casos del turno y arranca solo el primer expediente',
+  travelerStage: null,
+});
+
+const fetchWithTimeout = async (input: RequestInfo | URL, init: RequestInit, timeoutMs?: number, timeoutMessage?: string) => {
+  if (!timeoutMs || timeoutMs <= 0) {
+    return fetch(input, init);
+  }
+
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    const response = await fetch(input, {
+      ...init,
+      signal: controller.signal,
+    });
+
+    return response;
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new Error(timeoutMessage ?? 'La petición agotó el tiempo de espera.');
+    }
+
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+};
+
+const formatMediaProviderLabel = (provider: string | null | undefined, enabled: boolean): string => {
+  if (!enabled) {
+    return 'off';
+  }
+
+  return provider ?? 'none';
+};
+
+const normalizeProvider = (provider: string | null | undefined): AIProvider => {
+  if (provider === 'groq' || provider === 'openrouter' || provider === 'cerebras' || provider === 'vercel' || provider === 'local') {
+    return provider;
+  }
+
+  return 'sin conexión';
+};
+
+const getInitialDocument = (traveler: Traveler): DocumentType => {
+  const documents = traveler.documents;
+  const available = (Object.entries(documents) as Array<[DocumentType, Traveler['documents'][DocumentType]]>)
+    .filter(([, value]) => value !== null)
+    .map(([type]) => type);
+
+  return available[0] ?? 'passport';
+};
+
+const inferExpressionFromText = (text: string, demeanor: Traveler['profile']['demeanor']): PortraitExpression => {
+  const lowered = text.toLowerCase();
+
+  if (lowered.includes('no ') || lowered.includes('jamás') || lowered.includes('nunca')) {
+    return demeanor === 'aggressive' ? 'aggressive' : 'evasive';
+  }
+
+  if (lowered.includes('eh') || lowered.includes('...') || lowered.includes('no sé') || lowered.includes('creo')) {
+    return 'nervous';
+  }
+
+  if (lowered.includes('claro') || lowered.includes('por supuesto') || lowered.includes('desde luego')) {
+    return 'confident';
+  }
+
+  if (demeanor === 'friendly') {
+    return 'friendly';
+  }
+
+  if (demeanor === 'aggressive') {
+    return 'aggressive';
+  }
+
+  if (demeanor === 'evasive') {
+    return 'evasive';
+  }
+
+  return 'neutral';
+};
+
+const inferPortraitCellFromText = (text: string, demeanor: Traveler['profile']['demeanor']): PortraitCell => {
+  const lowered = text.toLowerCase();
+  if (
+    lowered.includes('no sé')
+    || lowered.includes('creo')
+    || lowered.includes('perdón')
+    || lowered.includes('eh')
+    || lowered.includes('...')
+  ) {
+    return 'pressure_soft';
+  }
+
+  if (
+    lowered.includes('jamás')
+    || lowered.includes('nunca')
+    || lowered.includes('claro que no')
+    || lowered.includes('¿qué insinúa')
+    || lowered.includes('esto es absurdo')
+  ) {
+    return 'pressure_hard';
+  }
+
+  if (demeanor === 'aggressive' || demeanor === 'evasive') {
+    return 'pressure_soft';
+  }
+
+  return 'arrival';
+};
+
+const formatCurrentState = (expression: PortraitExpression): string => {
+  switch (expression) {
+    case 'passport':
+      return 'neutro';
+    case 'friendly':
+      return 'amable';
+    case 'nervous':
+      return 'nervioso';
+    case 'evasive':
+      return 'evasivo';
+    case 'aggressive':
+      return 'agresivo';
+    case 'confident':
+      return 'seguro';
+    case 'neutral':
+    default:
+      return 'neutro';
+  }
+};
+
+const getInitialCurrentState = (portrait: PortraitState): string => formatCurrentState(portrait.selectedExpression);
+
+const getExpressionForPortraitCell = (portrait: PortraitState, cell: PortraitCell): PortraitExpression => {
+  const index = cell === 'passport' ? 0 : cell === 'arrival' ? 1 : cell === 'pressure_soft' ? 2 : 3;
+  return portrait.expressions[index] ?? portrait.selectedExpression;
+};
+
+const clampExpressionToPortrait = (portrait: PortraitState, expression: PortraitExpression): PortraitExpression => {
+  if (portrait.expressions.includes(expression)) {
+    return expression;
+  }
+
+  const fallback = portrait.expressions.find((item) => item !== 'passport');
+  return fallback ?? 'passport';
+};
+
+const toApiMessages = (messages: ChatMessage[]) => {
+  return messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => ({
+      role: message.role === 'traveler' ? 'assistant' : 'user',
+      content: message.content,
+    }))
+    .slice(-8);
+};
+
+const buildTravelerChatContext = (traveler: Traveler, scenario: ScenarioState | null): string => {
+  const docs = traveler.documents;
+
+  return [
+    `CONTEXTO OFICIAL DEL EXPEDIENTE. Fecha de inspección: ${scenario?.inspectionDate ?? 'desconocida'}.`,
+    `Perfil: ${traveler.profile.name}, ${traveler.profile.nationality}, motivo declarado: ${traveler.profile.stated_purpose}.`,
+    `Pasaporte: número ${docs.passport.number}, nacimiento ${docs.passport.birth_date}, expedido ${docs.passport.issue_date}, caduca ${docs.passport.expiry_date}.`,
+    docs.flight_ticket
+      ? `Billete: ${docs.flight_ticket.origin} → ${docs.flight_ticket.destination}, fecha ${docs.flight_ticket.date}, vuelo ${docs.flight_ticket.flight_number}.`
+      : null,
+    docs.hotel_reservation
+      ? `Hotel: ${docs.hotel_reservation.hotel}, ${docs.hotel_reservation.city}, check-in ${docs.hotel_reservation.check_in}, check-out ${docs.hotel_reservation.check_out}.`
+      : null,
+    docs.visa
+      ? `Visado: ${docs.visa.type}, válido desde ${docs.visa.valid_from} hasta ${docs.visa.valid_until}.`
+      : null,
+    docs.work_contract
+      ? `Contrato: ${docs.work_contract.company}, ${docs.work_contract.position}, inicio ${docs.work_contract.start_date}.`
+      : null,
+  ]
+    .filter(Boolean)
+    .join(' ');
+};
+
+const buildFallbackBriefing = (day: number, caseIds: Array<number | null>): DayBriefing => {
+  const suspiciousCases = caseIds.filter((value): value is number => value !== null).length;
+
+  return {
+    classification_level: suspiciousCases >= 3 ? 'CONFIDENCIAL' : suspiciousCases >= 1 ? 'USO INTERNO' : 'RUTINA',
+    alert_title: suspiciousCases >= 3
+      ? 'Alerta preventiva sobre expedientes de alta sensibilidad'
+      : suspiciousCases >= 1
+        ? 'Circular de seguimiento documental para llegadas internacionales'
+        : 'Recordatorio de protocolo ordinario de admisión',
+    alert_body: suspiciousCases >= 1
+      ? `Día ${day}. Se recomienda reforzar la lectura cruzada de documentos y mantener trazabilidad estricta en incidencias de entrada. Varias alertas internas sugieren discrepancias discretas en expedientes no consecutivos.`
+      : `Día ${day}. No constan alertas extraordinarias previas al inicio del turno. Mantenga el protocolo habitual y registre cualquier anomalía documental o conductual que requiera revisión posterior.`,
+    watch_for: suspiciousCases >= 1
+      ? [
+          'Fechas plausibles pero alineadas de forma poco natural entre documentos.',
+          'Declaraciones breves que intenten cerrar la inspección demasiado rápido.',
+          'Expedientes con soporte documental correcto pero detalles cruzados inestables.',
+        ]
+      : [
+          'Documentación emitida muy recientemente para viajes de baja justificación.',
+          'Relatos poco precisos sobre alojamiento, retorno o contactos locales.',
+        ],
+  };
+};
+
+const buildFallbackNews = (results: GameClientState['dayResults']): DayNews => {
+  const dramaticResult =
+    results.find((result) => result.was_guilty && result.player_decision === 'approve')
+    ?? results.find((result) => !result.was_guilty && result.player_decision === 'reject')
+    ?? results[0];
+
+  const crossedControl = dramaticResult?.player_decision === 'approve';
+  const actionText = crossedControl ? 'consiguió superar el control fronterizo' : 'fue retenido en el filtro migratorio';
+
+  return {
+    outlet: 'Boletin de noticias',
+    headline: dramaticResult
+      ? `${dramaticResult.traveler_name} ${actionText} tras una inspección prolongada en Levante`
+      : 'La jornada cierra sin incidencias reseñables en el control de Levante',
+    subheadline: dramaticResult
+      ? 'Las autoridades mantienen la revisión interna de un expediente que concentró la atención del turno.'
+      : 'Las autoridades aeroportuarias describen una operativa estable al cierre de la jornada.',
+    body: dramaticResult
+      ? `${dramaticResult.traveler_name} protagonizó uno de los episodios más comentados del cierre de jornada en el Aeropuerto Internacional Levante, donde la revisión de su expediente concentró recursos durante buena parte del turno. Fuentes aeroportuarias evitaron detallar el contenido de la incidencia, aunque confirmaron que el caso quedó formalmente registrado para seguimiento administrativo.\n\nLa secuencia terminó cuando la persona ${crossedControl ? 'superó' : 'no superó'} el control documental, un desenlace que ha reactivado la conversación interna sobre la presión operativa en las franjas finales del día. Por el momento no se han comunicado medidas adicionales más allá del protocolo habitual de revisión posterior.`
+      : 'El Aeropuerto Internacional Levante cerró la jornada con una operativa estable y sin incidencias de relieve en los filtros de entrada. Las autoridades mantuvieron el protocolo de verificación habitual y no registraron eventos extraordinarios al término del día.\n\nFuentes del recinto indicaron que la actividad se desarrolló dentro de los parámetros previstos y que cualquier ajuste administrativo quedará circunscrito a los procedimientos internos de revisión ordinaria.',
+    timestamp: 'Hoy, 23:47',
+  };
+};
+
+type GameClientState = ReturnType<typeof createInitialGameState>;
+
+const getCurrentPlannedCase = (state: GameClientState): number | null => {
+  return state.currentDayCaseIds[state.travelerIndexInDay] ?? null;
+};
+
+const getLoadingPresentation = (loadingState: LoadingState) => {
+  if (!loadingState.active) {
+    return {
+      title: 'Preparando expediente',
+      currentStep: 'Inicializando sistema',
+      detail: null,
+      progress: 0,
+      maxProgress: 0,
+      waiting: false,
+    };
+  }
+
+  if (loadingState.mode === 'traveler') {
+    const travelerStepMap: Record<TravelerLoadingStage, { currentStep: string; detail: string; progress: number; maxProgress: number }> = {
+      requesting: {
+        currentStep: 'Abriendo expediente del viajero',
+        detail: 'Solicitando caso y documentación base al generador de expedientes',
+        progress: 60,
+        maxProgress: 72,
+      },
+      receiving: {
+        currentStep: 'Recibiendo documentación del viajero',
+        detail: 'La API respondió; ensamblando los documentos y la narrativa del caso',
+        progress: 72,
+        maxProgress: 84,
+      },
+      validated: {
+        currentStep: 'Validando expediente y preparando mesa',
+        detail: 'Comprobando el payload final y colocando el expediente en el puesto de control',
+        progress: 84,
+        maxProgress: 92,
+      },
+    };
+    const travelerStage = loadingState.travelerStage ?? 'requesting';
+    const travelerPresentation = travelerStepMap[travelerStage];
+
+    return {
+      title: 'Preparando expediente',
+      currentStep: travelerPresentation.currentStep,
+      detail: loadingState.detail ?? travelerPresentation.detail,
+      progress: travelerPresentation.progress,
+      maxProgress: travelerPresentation.maxProgress,
+      waiting: true,
+    };
+  }
+
+  const rosterRatio = loadingState.rosterTotal > 0 ? loadingState.rosterCompleted / loadingState.rosterTotal : 0;
+  const progress = Math.min(
+    99,
+    Math.round(
+      10
+      + rosterRatio * 45
+      + (loadingState.briefingReady ? 15 : 0)
+      + (loadingState.phase === 'photos' ? 15 : 0)
+      + (loadingState.photosReady ? 10 : 0)
+      + (loadingState.phase === 'finalizing' ? 5 : 0),
+    ),
+  );
+
+  if (loadingState.phase === 'roster' && loadingState.rosterCompleted < loadingState.rosterTotal) {
+    return {
+      title: 'Preparando jornada',
+      currentStep: loadingState.rosterCompleted === 0
+        ? 'Planificando cola del día'
+        : 'Preparando primer expediente operativo',
+      detail: loadingState.rosterCompleted === 0
+        ? 'El sistema fija los casos del turno y arranca solo el primer expediente'
+        : 'El briefing puede llegar mientras se termina de montar el primer viajero',
+      progress,
+      maxProgress: progress,
+      waiting: true,
+    };
+  }
+
+  if (!loadingState.briefingReady) {
+    return {
+      title: 'Preparando jornada',
+      currentStep: 'Recibiendo briefing de seguridad',
+      detail: 'Consolidando alertas internas del turno sin precargar viajeros innecesarios',
+      progress: 55,
+      maxProgress: 70,
+      waiting: true,
+    };
+  }
+
+  return {
+    title: 'Preparando jornada',
+    currentStep: 'Preparando control fronterizo',
+      detail: 'Briefing listo y primer viajero disponible. En breve se abrirá el control fronterizo para recibir al primer pasajero del día',
+      progress: 100,
+      maxProgress: 100,
+      waiting: false,
+    };
+  };
+
+const getNewsPerformance = (results: GameClientState['dayResults']) => {
+  if (results.length > 0 && results.every((result) => result.was_correct)) {
+    return 'perfect' as const;
+  }
+
+  if (results.some((result) => result.was_guilty && result.player_decision === 'approve')) {
+    return 'guilty_passed' as const;
+  }
+
+  if (results.some((result) => !result.was_guilty && result.player_decision === 'reject')) {
+    return 'innocent_rejected' as const;
+  }
+
+  return 'mixed' as const;
+};
+
+const readTextResponse = async (
+  response: Response,
+  onChunk: (chunk: string) => void,
+): Promise<void> => {
+  const reader = response.body?.getReader();
+
+  if (!reader) {
+    throw new Error('No se pudo abrir el stream de la respuesta.');
+  }
+
+  const decoder = new TextDecoder();
+
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) {
+      break;
+    }
+
+    onChunk(decoder.decode(value, { stream: true }));
+  }
+
+  const tail = decoder.decode();
+  if (tail) {
+    onChunk(tail);
+  }
+};
+
+export function GameClient() {
+  const [state, dispatch] = useReducer(gameReducer, undefined, createInitialGameState);
+  const [chatLoading, setChatLoading] = useState(false);
+  const [transitionPending, setTransitionPending] = useState(false);
+  const [dayRoster, setDayRoster] = useState<PlannedTravelerResponse[]>([]);
+  const dayRosterRef = useRef<PlannedTravelerResponse[]>([]);
+  const daySlotPlansRef = useRef<DaySlotPlan[]>([]);
+  const travelerIndexRef = useRef<number>(0);
+  const [loadingState, setLoadingState] = useState<LoadingState>(createInitialDaySetupLoadingState);
+  const hasStartedRef = useRef(false);
+  const daySetupRequestRef = useRef(0);
+  const loadingPresentation = useMemo(() => getLoadingPresentation(loadingState), [loadingState]);
+
+  const [fallbackNotice, setFallbackNotice] = useState<{ id: number; message: string; visible: boolean } | null>(null);
+  const fallbackNoticeTimeoutRef = useRef<number | null>(null);
+  const [processedTravelersTotal, setProcessedTravelersTotal] = useState<number>(DEFAULT_PROCESSED_TRAVELERS_ESTIMATE);
+  const processedTravelerKeysRef = useRef<Set<string>>(new Set());
+
+  const showFallbackNotice = useCallback((failed: string, used: string) => {
+    const providers = failed.split(',').filter(Boolean);
+    if (providers.length === 0) return;
+    const failedNames = providers.join(' y ');
+    const id = Date.now();
+    if (fallbackNoticeTimeoutRef.current !== null) {
+      window.clearTimeout(fallbackNoticeTimeoutRef.current);
+    }
+    setFallbackNotice({ id, message: `${failedNames} no respondió, usando ${used}`, visible: true });
+    fallbackNoticeTimeoutRef.current = window.setTimeout(() => {
+      setFallbackNotice(prev => prev?.id === id ? { ...prev, visible: false } : prev);
+    }, 4000);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (fallbackNoticeTimeoutRef.current !== null) {
+        window.clearTimeout(fallbackNoticeTimeoutRef.current);
+      }
+    };
+  }, []);
+
+  const syncProcessedTravelersTotal = useCallback((total: number) => {
+    setProcessedTravelersTotal((current) => Math.max(current, total));
+  }, []);
+
+  const refreshProcessedTravelersTotal = useCallback(async () => {
+    try {
+      const response = await fetch('/api/processed-travelers', {
+        cache: 'no-store',
+      });
+
+      if (!response.ok) {
+        return;
+      }
+
+      const payload = (await response.json()) as ProcessedTravelersResponse;
+      syncProcessedTravelersTotal(payload.totalProcessedTravelers);
+    } catch {
+      syncProcessedTravelersTotal(DEFAULT_PROCESSED_TRAVELERS_ESTIMATE);
+    }
+  }, [syncProcessedTravelersTotal]);
+
+  const incrementProcessedTravelersTotal = useCallback((travelerName: string, day: number, slot: number) => {
+    const key = `${day}:${slot}:${travelerName}`;
+    if (processedTravelerKeysRef.current.has(key)) {
+      return;
+    }
+
+    processedTravelerKeysRef.current.add(key);
+    void fetch('/api/processed-travelers', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      cache: 'no-store',
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          return null;
+        }
+
+        return response.json() as Promise<ProcessedTravelersResponse>;
+      })
+      .then((payload) => {
+        if (!payload) {
+          return;
+        }
+
+        syncProcessedTravelersTotal(payload.totalProcessedTravelers);
+      })
+      .catch(() => undefined);
+  }, [syncProcessedTravelersTotal]);
+
+  useEffect(() => {
+    void refreshProcessedTravelersTotal();
+  }, [refreshProcessedTravelersTotal]);
+
+  const fetchTravelerPayload = useCallback(async (
+    day: number,
+    options?: {
+      inconsistencyId?: number | null;
+      slotPlan?: DaySlotPlan;
+      onStageChange?: (stage: TravelerLoadingStage, detail?: string) => void;
+    },
+  ) => {
+    const response = await fetchWithTimeout('/api/generate-traveler', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        day,
+        ...(options?.slotPlan
+          ? { slot_plan: options.slotPlan }
+          : options?.inconsistencyId === null
+            ? { force_clean: true }
+            : options?.inconsistencyId
+              ? { inconsistency_id: options.inconsistencyId }
+              : {}),
+      }),
+    });
+
+    if (!response.ok) {
+      const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+      throw new Error(payload?.error ?? 'No se pudo generar el viajero.');
+    }
+
+    const failedProviders = response.headers.get('x-ai-failed-providers');
+    const usedProvider = response.headers.get('x-ai-provider');
+    if (failedProviders && usedProvider) {
+      showFallbackNotice(failedProviders, usedProvider);
+    }
+
+    options?.onStageChange?.('receiving', 'La API ya respondió; descargando y montando el expediente del viajero');
+
+    const payload = (await response.json()) as GenerateTravelerResponse;
+    const parsed = TravelerSchema.safeParse(payload.traveler);
+
+    if (!parsed.success) {
+      throw new Error('La respuesta del viajero no pasó la validación del cliente.');
+    }
+
+    options?.onStageChange?.('validated', 'Expediente validado. Ajustando mesa, documentos y estado inicial del viajero');
+
+    return {
+      ...payload,
+      traveler: parsed.data,
+    } satisfies GenerateTravelerResponse;
+  }, [showFallbackNotice]);
+
+  const cacheTraveler = useCallback((index: number, payload: PlannedTravelerResponse) => {
+    setDayRoster((current) => {
+      const next = current.length === TRAVELERS_PER_DAY
+        ? [...current]
+        : Array.from({ length: TRAVELERS_PER_DAY }, (_, currentIndex) => current[currentIndex] ?? null);
+      next[index] = payload;
+      dayRosterRef.current = next;
+      return next;
+    });
+  }, []);
+
+  const openPlannedTraveler = useCallback((payload: PlannedTravelerResponse) => {
+    if (!payload) {
+      return false;
+    }
+
+    dispatch({
+      type: 'load_success',
+      traveler: payload.traveler,
+      providerUsed: payload.provider_used,
+      textModelUsed: payload.text_model_used,
+      activeDocument: getInitialDocument(payload.traveler),
+      scenario: payload.scenario,
+      portrait: payload.portrait,
+      audioEnabled: payload.media.audioEnabled,
+      imageEnabled: payload.media.imageEnabled,
+      audioModelUsed: payload.media.audioModel,
+      imageModelUsed: payload.portrait.model ?? payload.media.imageModel,
+      currentState: getInitialCurrentState(payload.portrait),
+    });
+
+    incrementProcessedTravelersTotal(
+      payload.traveler.profile.name,
+      state.day,
+      state.travelerIndexInDay,
+    );
+
+    return true;
+  }, [incrementProcessedTravelersTotal, state.day, state.travelerIndexInDay]);
+
+  const loadTraveler = useCallback(async (day: number, options?: { inconsistencyId?: number | null; slotPlan?: DaySlotPlan; cacheIndex?: number }) => {
+    dispatch({ type: 'start_loading' });
+    setLoadingState({
+      ...INITIAL_LOADING_STATE,
+      active: true,
+      mode: 'traveler',
+      phase: 'finalizing',
+      detail: 'Solicitando caso y documentación base al generador de expedientes',
+      travelerStage: 'requesting',
+    });
+
+    try {
+      const payload = await fetchTravelerPayload(day, {
+        ...options,
+        onStageChange: (travelerStage, detail) => {
+          setLoadingState((current) => {
+            if (current.mode !== 'traveler') {
+              return current;
+            }
+
+            return {
+              ...current,
+              travelerStage,
+              detail: detail ?? current.detail,
+            };
+          });
+        },
+      });
+
+      const cacheIndex = typeof options?.cacheIndex === 'number' ? options.cacheIndex : undefined;
+
+      if (typeof cacheIndex === 'number') {
+        cacheTraveler(cacheIndex, payload);
+      }
+
+      dispatch({
+        type: 'load_success',
+        traveler: payload.traveler,
+        providerUsed: payload.provider_used,
+        textModelUsed: payload.text_model_used,
+        activeDocument: getInitialDocument(payload.traveler),
+        scenario: payload.scenario,
+        portrait: payload.portrait,
+        audioEnabled: payload.media.audioEnabled,
+        imageEnabled: payload.media.imageEnabled,
+        audioModelUsed: payload.media.audioModel,
+        imageModelUsed: payload.portrait.model ?? payload.media.imageModel,
+        currentState: getInitialCurrentState(payload.portrait),
+      });
+      incrementProcessedTravelersTotal(
+        payload.traveler.profile.name,
+        day,
+        typeof options?.cacheIndex === 'number' ? options.cacheIndex : state.travelerIndexInDay,
+      );
+      setLoadingState(INITIAL_LOADING_STATE);
+    } catch (error) {
+      setLoadingState(INITIAL_LOADING_STATE);
+      dispatch({
+        type: 'load_failure',
+        message: error instanceof Error ? error.message : 'Error desconocido al generar el viajero.',
+      });
+    }
+  }, [cacheTraveler, fetchTravelerPayload, incrementProcessedTravelersTotal, state.travelerIndexInDay]);
+
+  const ensureTravelerLoaded = useCallback(async (index: number, day: number) => {
+    const plannedTraveler = dayRoster[index];
+    if (plannedTraveler) {
+      openPlannedTraveler(plannedTraveler);
+      return;
+    }
+
+    const slotPlan = daySlotPlansRef.current[index];
+    await loadTraveler(day, {
+      slotPlan,
+      cacheIndex: index,
+    });
+  }, [dayRoster, loadTraveler, openPlannedTraveler]);
+
+  const loadDaySetup = useCallback(async (day: number, recentCaseIdsByDay: number[][]) => {
+    const requestId = daySetupRequestRef.current + 1;
+    daySetupRequestRef.current = requestId;
+    processedTravelerKeysRef.current.clear();
+    const caseIds = planDayCaseIds(day, recentCaseIdsByDay);
+    const slotPlans = buildDaySlotPlans(caseIds);
+    daySlotPlansRef.current = slotPlans;
+    const emptyRoster: PlannedTravelerResponse[] = Array.from({ length: TRAVELERS_PER_DAY }, () => null);
+    setDayRoster(emptyRoster);
+    dayRosterRef.current = emptyRoster;
+    setLoadingState({
+      ...INITIAL_LOADING_STATE,
+      active: true,
+      mode: 'day_setup',
+      phase: 'roster',
+      rosterTotal: caseIds.length,
+      detail: 'Inicializando casos del turno y preparando solo el primer expediente',
+    });
+
+    try {
+      const briefingPromise = fetchWithTimeout('/api/generate-day-briefing', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ day, case_ids: caseIds }),
+        })
+        .then(async (response) => {
+          if (!response.ok) {
+            throw new Error('No se pudo generar el briefing del día.');
+          }
+
+          const failedProviders = response.headers.get('x-ai-failed-providers');
+          const usedProvider = response.headers.get('x-ai-provider');
+          if (failedProviders && usedProvider) {
+            showFallbackNotice(failedProviders, usedProvider);
+          }
+
+          const payload = (await response.json()) as GenerateDayBriefingResponse;
+          return payload.briefing;
+        })
+        .catch(() => buildFallbackBriefing(day, caseIds))
+        .then((briefing) => {
+          if (daySetupRequestRef.current !== requestId) {
+            return briefing;
+          }
+
+          setLoadingState((current) => ({
+            ...current,
+            briefingReady: true,
+            detail: 'Briefing recibido. Esperando a que el primer expediente quede listo para abrir el turno',
+          }));
+          return briefing;
+        });
+
+      const firstTravelerPromise = fetchTravelerPayload(day, {
+        slotPlan: slotPlans[0],
+        onStageChange: (travelerStage, detail) => {
+          if (daySetupRequestRef.current !== requestId) {
+            return;
+          }
+
+          setLoadingState((current) => ({
+            ...current,
+            rosterCompleted: 1,
+            travelerStage,
+            detail: detail ?? current.detail,
+          }));
+        },
+      }).then((payload) => {
+        if (daySetupRequestRef.current === requestId) {
+          cacheTraveler(0, payload);
+        }
+
+        return payload;
+      });
+
+      const [briefing] = await Promise.all([briefingPromise, firstTravelerPromise]);
+
+      if (daySetupRequestRef.current !== requestId) {
+        return;
+      }
+
+      dispatch({ type: 'set_day_setup', briefing, caseIds });
+
+      setLoadingState((current) => ({
+        ...current,
+        phase: 'finalizing',
+        active: false,
+        rosterCompleted: 1,
+        detail: 'Briefing y primer expediente listos. En breve se abrirá el control fronterizo.',
+      }));
+    } catch {
+      if (daySetupRequestRef.current !== requestId) {
+        return;
+      }
+
+      setDayRoster((current) => {
+        const normalized = current.length === TRAVELERS_PER_DAY
+          ? current
+          : Array.from({ length: TRAVELERS_PER_DAY }, (_, index) => current[index] ?? null);
+        dayRosterRef.current = normalized;
+        return normalized;
+      });
+      setLoadingState({
+        ...INITIAL_LOADING_STATE,
+        active: false,
+        mode: 'day_setup',
+      });
+
+      if (!state.briefing || state.day !== day) {
+        dispatch({ type: 'set_day_setup', briefing: buildFallbackBriefing(day, caseIds), caseIds });
+      }
+    }
+  }, [cacheTraveler, fetchTravelerPayload, state.briefing, state.day, showFallbackNotice]);
+
+  const loadDayNews = useCallback(async (day: number, results: GameClientState['dayResults']) => {
+    try {
+      const response = await fetch('/api/generate-day-news', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ day, results }),
+      });
+
+      if (!response.ok) {
+        throw new Error('No se pudo generar la noticia del día.');
+      }
+
+      const failedProviders = response.headers.get('x-ai-failed-providers');
+      const usedProvider = response.headers.get('x-ai-provider');
+      if (failedProviders && usedProvider) {
+        showFallbackNotice(failedProviders, usedProvider);
+      }
+
+      const payload = (await response.json()) as GenerateDayNewsResponse;
+      dispatch({ type: 'set_day_news', news: payload.news });
+    } catch {
+      dispatch({ type: 'set_day_news', news: buildFallbackNews(results) });
+    }
+  }, [showFallbackNotice]);
+
+  useEffect(() => {
+    if (hasStartedRef.current) {
+      return;
+    }
+
+    hasStartedRef.current = true;
+    void loadDaySetup(1, []);
+  }, [loadDaySetup]);
+
+  useEffect(() => {
+    travelerIndexRef.current = state.travelerIndexInDay;
+  }, [state.travelerIndexInDay]);
+
+  const performChatTurn = useCallback(
+    async ({
+      agentText,
+      appendAgentMessage,
+      consumeQuestion,
+    }: {
+      agentText: string;
+      appendAgentMessage: boolean;
+      consumeQuestion: boolean;
+    }) => {
+      if (!state.currentTraveler || chatLoading) {
+        return;
+      }
+
+      const travelerMessageId = typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15);
+      let outgoingMessages = state.chatHistory;
+
+      if (appendAgentMessage) {
+        const agentMessage: ChatMessage = {
+          id: typeof crypto !== "undefined" && crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 15),
+          role: 'agent',
+          content: agentText.trim(),
+        };
+
+        outgoingMessages = [...state.chatHistory, agentMessage];
+        dispatch({ type: 'add_agent_message', message: agentMessage });
+      }
+
+      setChatLoading(true);
+      let receivedTravelerChunk = false;
+      let travelerResponseText = '';
+
+      try {
+        const response = await fetch('/api/chat', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            systemPrompt: `${state.currentTraveler.conversation_system_prompt}\n\n${buildTravelerChatContext(state.currentTraveler, state.scenario)}`,
+            messages: toApiMessages(outgoingMessages),
+          }),
+        });
+
+        if (!response.ok) {
+          const payload = (await response.json().catch(() => null)) as { error?: string } | null;
+          throw new Error(payload?.error ?? 'No se pudo obtener respuesta del viajero.');
+        }
+
+        const failedProviders = response.headers.get('x-ai-failed-providers');
+        const usedProvider = response.headers.get('x-ai-provider');
+        if (failedProviders && usedProvider) {
+          showFallbackNotice(failedProviders, usedProvider);
+        }
+
+        await readTextResponse(response, (chunk) => {
+          if (chunk.length > 0) {
+            receivedTravelerChunk = true;
+            travelerResponseText += chunk;
+            dispatch({ type: 'append_traveler_chunk', id: travelerMessageId, chunk });
+          }
+        });
+
+        if (!receivedTravelerChunk) {
+          throw new Error('El viajero no respondió con contenido.');
+        }
+
+        const visibleTravelerResponse = travelerResponseText.trim();
+        const audioTravelerResponse = sanitizeDialogueText(travelerResponseText).trim() || visibleTravelerResponse;
+
+        if (visibleTravelerResponse) {
+          dispatch({
+            type: 'replace_message_content',
+            id: travelerMessageId,
+            content: visibleTravelerResponse,
+          });
+        }
+
+        dispatch({
+          type: 'complete_chat_turn',
+          providerUsed: normalizeProvider(response.headers.get('x-ai-provider') ?? state.provider_used),
+          modelUsed: response.headers.get('x-ai-model') ?? state.text_model_used,
+          consumeQuestion,
+        });
+
+        const inferredCell = inferPortraitCellFromText(audioTravelerResponse, state.currentTraveler.profile.demeanor);
+        const inferredExpression = clampExpressionToPortrait(
+          state.portrait,
+          getExpressionForPortraitCell(state.portrait, inferredCell) ?? inferExpressionFromText(audioTravelerResponse, state.currentTraveler.profile.demeanor),
+        );
+
+        dispatch({
+          type: 'set_portrait_state',
+          cell: inferredCell,
+          expression: inferredExpression,
+        });
+
+        dispatch({
+          type: 'set_current_state',
+          currentState: formatCurrentState(inferredExpression),
+        });
+
+        if (state.audio_enabled) {
+          const audioResponse = await fetch('/api/generate-audio', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({
+              text: audioTravelerResponse,
+              demeanor: state.currentTraveler.profile.demeanor,
+              gender: state.currentTraveler.profile.gender,
+              voiceSeed: state.currentTraveler.documents.passport.number,
+            }),
+          });
+
+          if (audioResponse.ok) {
+            const audioPayload = (await audioResponse.json()) as AudioResponse;
+            if (audioPayload.status === 'ready' && audioPayload.audioUrl) {
+              dispatch({
+                type: 'set_message_audio',
+                id: travelerMessageId,
+                audioUrl: audioPayload.audioUrl,
+                provider: audioPayload.provider,
+                model: audioPayload.model,
+                voiceId: audioPayload.voiceId,
+                sanitizedText: audioPayload.sanitizedText ?? null,
+              });
+            }
+          }
+        }
+      } catch (error) {
+        dispatch({
+          type: 'set_chat_error',
+          message: error instanceof Error ? error.message : 'La conversación falló.',
+          openingReply: !consumeQuestion,
+        });
+      } finally {
+        setChatLoading(false);
+      }
+    },
+    [chatLoading, state.audio_enabled, state.chatHistory, state.currentTraveler, state.portrait, state.provider_used, state.scenario, state.text_model_used, showFallbackNotice],
+  );
+
+  useEffect(() => {
+    if (
+      !state.currentTraveler ||
+      state.openingReplyStatus !== 'pending' ||
+      state.chatHistory.length !== 1 ||
+      state.chatHistory[0]?.content !== INITIAL_AGENT_GREETING ||
+      chatLoading
+    ) {
+      return;
+    }
+
+    void performChatTurn({
+      agentText: INITIAL_AGENT_GREETING,
+      appendAgentMessage: false,
+      consumeQuestion: false,
+    });
+  }, [chatLoading, performChatTurn, state.chatHistory, state.currentTraveler, state.openingReplyStatus]);
+
+  const sendQuestion = useCallback(
+    async (text: string) => {
+      if (!state.currentTraveler || chatLoading) {
+        return;
+      }
+
+      await performChatTurn({
+        agentText: text,
+        appendAgentMessage: true,
+        consumeQuestion: true,
+      });
+    },
+    [chatLoading, performChatTurn, state.currentTraveler],
+  );
+
+  const resolveDecision = useCallback(
+    (decision: Decision) => {
+      dispatch({ type: 'resolve_round', decision });
+    },
+    [],
+  );
+
+  const handleStartDay = useCallback(async () => {
+    if (transitionPending) {
+      return;
+    }
+
+    setTransitionPending(true);
+    try {
+      dispatch({ type: 'dismiss_briefing' });
+      const plannedTraveler = dayRoster[0];
+
+      if (plannedTraveler) {
+        openPlannedTraveler(plannedTraveler);
+      } else {
+        await loadTraveler(state.day, { slotPlan: daySlotPlansRef.current[0], cacheIndex: 0 });
+      }
+    } finally {
+      setTransitionPending(false);
+    }
+  }, [dayRoster, loadTraveler, openPlannedTraveler, state, transitionPending]);
+
+  const handleNextTraveler = useCallback(async () => {
+    if (transitionPending) {
+      return;
+    }
+
+    setTransitionPending(true);
+    const nextTravelerIndex = state.travelerIndexInDay + 1;
+    const isEndOfDay = nextTravelerIndex >= TRAVELERS_PER_DAY;
+    try {
+      dispatch({ type: 'prepare_next_traveler' });
+
+      if (isEndOfDay) {
+        await loadDayNews(state.day, state.dayResults);
+        return;
+      }
+
+      await ensureTravelerLoaded(nextTravelerIndex, state.day);
+    } finally {
+      setTransitionPending(false);
+    }
+  }, [ensureTravelerLoaded, loadDayNews, state.day, state.dayResults, state.travelerIndexInDay, transitionPending]);
+
+  const handleNextDay = useCallback(async () => {
+    if (transitionPending) {
+      return;
+    }
+
+    setTransitionPending(true);
+    const currentDayUsedIds = Array.from(new Set(state.currentDayCaseIds.filter((value): value is number => value !== null)));
+    const nextRecentCaseIdsByDay = [...state.recentCaseIdsByDay, currentDayUsedIds].slice(-2);
+    const nextDay = state.day + 1;
+
+    try {
+      setDayRoster([]);
+      dayRosterRef.current = [];
+      dispatch({ type: 'advance_day' });
+      await loadDaySetup(nextDay, nextRecentCaseIdsByDay);
+    } finally {
+      setTransitionPending(false);
+    }
+  }, [loadDaySetup, state.currentDayCaseIds, state.day, state.recentCaseIdsByDay, transitionPending]);
+
+  const canShowDecisionButtons = useMemo(
+    () => state.phase === 'deciding' || state.questionsAsked >= MAX_QUESTIONS,
+    [state.phase, state.questionsAsked],
+  );
+
+  if (state.phase === 'game_over') {
+    return (
+      <main className="mx-auto flex min-h-screen w-full max-w-5xl items-center justify-center px-4 py-10 scanline">
+        <section className="relative w-full rounded-none border border-red-500/30 bg-[#030a14]/90 p-8 shadow-neon-amber backdrop-blur-md">
+          <div className="pointer-events-none absolute inset-0 m-1 border-[1px] border-red-500/10" />
+          
+          <div className="relative z-10">
+            <div className="flex items-center gap-3">
+              <div className="h-3 w-3 animate-pulse bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.8)]" />
+              <p className="font-mono text-[11px] font-bold uppercase tracking-[0.4em] text-red-500">Brecha de Seguridad Detectada</p>
+            </div>
+            
+            <h1 className="mt-4 font-sans text-5xl font-black uppercase tracking-[0.2em] text-red-100 drop-shadow-[0_0_15px_rgba(239,68,68,0.3)]">
+              Turno Finalizado
+            </h1>
+            
+            <p className="mt-6 max-w-2xl font-mono text-sm leading-relaxed text-red-200/80 border-l-2 border-red-900/50 pl-4">
+              Acumulaste tres decisiones erróneas. El protocolo de seguridad ha sido activado y tu sesión operativa ha sido suspendida. Tu jornada termina con {state.score.correct} aciertos y una racha máxima de {state.score.streak}.
+            </p>
+            
+            <div className="mt-10 grid gap-4 sm:grid-cols-3 font-mono text-sm">
+              <div className="flex flex-col gap-1 rounded-none border border-emerald-900/30 bg-emerald-950/10 p-5">
+                <span className="text-[10px] text-emerald-600 uppercase tracking-widest">Aciertos</span>
+                <span className="text-2xl font-bold text-emerald-400">{state.score.correct}</span>
+              </div>
+              <div className="flex flex-col gap-1 rounded-none border border-red-900/50 bg-red-950/20 p-5 shadow-[inset_0_0_15px_rgba(239,68,68,0.1)]">
+                <span className="text-[10px] text-red-600 uppercase tracking-widest">Fallos Críticos</span>
+                <span className="text-2xl font-bold text-red-500">{state.score.wrong}</span>
+              </div>
+              <div className="flex flex-col gap-1 rounded-none border border-cyan-900/30 bg-cyan-950/10 p-5">
+                <span className="text-[10px] text-cyan-600 uppercase tracking-widest">Día Alcanzado</span>
+                <span className="text-2xl font-bold text-cyan-400">{state.day}</span>
+              </div>
+            </div>
+            
+            <button
+              type="button"
+              onClick={() => {
+                setDayRoster([]);
+                dayRosterRef.current = [];
+                dispatch({ type: 'restart_game' });
+                void loadDaySetup(1, []);
+              }}
+              className="mt-10 w-full sm:w-auto rounded-none border border-cyan-500/40 bg-cyan-950/30 px-8 py-4 font-mono text-sm font-bold uppercase tracking-[0.25em] text-cyan-200 transition hover:border-cyan-400 hover:bg-cyan-900/50 hover:shadow-neon-cyan"
+            >
+              Reiniciar Jornada
+            </button>
+          </div>
+        </section>
+      </main>
+    );
+  }
+
+  return (
+    <main className="scanline mx-auto flex min-h-screen w-full max-w-[1600px] flex-col gap-4 px-3 py-4 sm:px-5 lg:h-[100dvh] lg:overflow-hidden lg:px-6">
+      <ScoreBar
+        day={state.day}
+        travelerIndexInDay={state.travelerIndexInDay}
+        travelersPerDay={TRAVELERS_PER_DAY}
+        score={state.score}
+        processedTravelersTotal={processedTravelersTotal}
+        onToggleDebug={() => dispatch({ type: 'toggle_debug' })}
+      />
+
+      <div className="grid gap-4 lg:min-h-0 lg:flex-1 lg:grid-cols-[1.2fr_0.8fr] lg:grid-rows-[minmax(0,1fr)]">
+        <section className="flex flex-col gap-4 lg:min-h-0 lg:overflow-hidden">
+          <div className="flex gap-2 lg:hidden">
+            <button
+              type="button"
+              onClick={() => dispatch({ type: 'set_mobile_panel', panel: 'documents' })}
+              className={`flex-1 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] ${
+                state.mobilePanel === 'documents'
+                  ? 'border-cyan-400 bg-cyan-500/10 text-cyan-200'
+                  : 'border-slate-800 bg-slate-950 text-slate-400'
+              }`}
+            >
+              Documentos
+            </button>
+            <button
+              type="button"
+              onClick={() => dispatch({ type: 'set_mobile_panel', panel: 'chat' })}
+              className={`flex-1 rounded-full border px-4 py-2 text-xs font-semibold uppercase tracking-[0.25em] ${
+                state.mobilePanel === 'chat'
+                  ? 'border-cyan-400 bg-cyan-500/10 text-cyan-200'
+                  : 'border-slate-800 bg-slate-950 text-slate-400'
+              }`}
+            >
+              Conversación
+            </button>
+          </div>
+
+          {
+            <div className="hidden lg:flex lg:min-h-0 lg:flex-1 lg:flex-col">
+              {state.currentTraveler ? (
+                <DocumentViewer
+                  documents={state.currentTraveler.documents}
+                  portrait={state.portrait}
+                  activeDocument={state.activeDocument}
+                  onSelectDocument={(document) => dispatch({ type: 'set_active_document', document })}
+                />
+              ) : (
+                <LoadingScreen
+                  key={`loading-desktop-${loadingState.mode}-${state.day}-${state.travelerIndexInDay}`}
+                  active
+                  title={loadingPresentation.title}
+                  detail={loadingPresentation.detail ?? undefined}
+                  progress={loadingPresentation.progress}
+                  maxProgress={loadingPresentation.maxProgress}
+                  currentStep={loadingPresentation.currentStep}
+                  waiting={loadingPresentation.waiting}
+                />
+              )}
+            </div>
+          }
+
+          {state.mobilePanel === 'documents' && (
+            <div className="lg:hidden">
+              {state.currentTraveler ? (
+                <DocumentViewer
+                  documents={state.currentTraveler.documents}
+                  portrait={state.portrait}
+                  activeDocument={state.activeDocument}
+                  onSelectDocument={(document) => dispatch({ type: 'set_active_document', document })}
+                />
+              ) : (
+                <LoadingScreen
+                  key={`loading-mobile-${loadingState.mode}-${state.day}-${state.travelerIndexInDay}`}
+                  active
+                  title={loadingPresentation.title}
+                  detail={loadingPresentation.detail ?? undefined}
+                  progress={loadingPresentation.progress}
+                  maxProgress={loadingPresentation.maxProgress}
+                  currentStep={loadingPresentation.currentStep}
+                  waiting={loadingPresentation.waiting}
+                />
+              )}
+            </div>
+          )}
+
+          {canShowDecisionButtons ? (
+            <DecisionButtons
+              disabled={!state.currentTraveler || transitionPending}
+              onApproveAction={() => resolveDecision('approve')}
+              onRejectAction={() => resolveDecision('reject')}
+            />
+          ) : (
+            <div className="flex flex-wrap items-center justify-center gap-3 rounded-2xl border border-slate-800 bg-slate-950/90 p-4">
+              <span className="text-[10px] uppercase tracking-widest font-mono text-slate-500">
+                TXT: <span className="text-cyan-400">{state.provider_used}</span>
+              </span>
+              <span className="hidden sm:inline text-[10px] text-slate-700">|</span>
+              <span className="text-[10px] uppercase tracking-widest font-mono text-slate-500">
+                AUD: <span className="text-cyan-400">{formatMediaProviderLabel(state.audio_provider_used, state.audio_enabled)}</span>
+              </span>
+              <span className="hidden sm:inline text-[10px] text-slate-700">|</span>
+              <span className="text-[10px] uppercase tracking-widest font-mono text-slate-500">
+                IMG: <span className="text-cyan-400">{formatMediaProviderLabel(state.image_provider_used, state.image_enabled)}</span>
+              </span>
+            </div>
+          )}
+        </section>
+
+        <section className="block lg:flex lg:min-h-0 lg:flex-col lg:overflow-hidden">
+          <div className={`${state.mobilePanel === 'chat' ? 'block' : 'hidden'} lg:flex lg:min-h-0 lg:flex-1`}>
+            <ChatPanel
+              messages={state.chatHistory}
+              onSendMessage={(text) => void sendQuestion(text)}
+              isLoading={chatLoading}
+              questionsAsked={state.questionsAsked}
+              onTakeDecision={() => dispatch({ type: 'enter_deciding' })}
+              currentState={state.current_state}
+              portrait={state.portrait}
+              disabled={!state.currentTraveler || transitionPending}
+              travelerName={state.currentTraveler?.profile.name}
+            />
+          </div>
+        </section>
+      </div>
+
+      {state.error ? (
+        <div className="rounded-2xl border border-red-900/40 bg-red-950/20 px-4 py-3 text-sm text-red-100">
+          {state.error}
+          {!state.currentTraveler ? (
+            <>
+              {' '}
+              <button
+                type="button"
+                onClick={() => {
+                  const rosterEntry = dayRoster[state.travelerIndexInDay];
+                  if (rosterEntry) {
+                    openPlannedTraveler(rosterEntry);
+                    return;
+                  }
+
+                  void loadTraveler(state.day, { slotPlan: daySlotPlansRef.current[state.travelerIndexInDay], cacheIndex: state.travelerIndexInDay });
+                }}
+                className="font-semibold uppercase tracking-[0.2em] text-red-200 underline-offset-4 hover:underline"
+              >
+                Reintentar
+              </button>
+            </>
+          ) : null}
+        </div>
+      ) : null}
+
+      {state.debugOpen && state.currentTraveler ? (
+        <div
+          className="fixed inset-0 z-[85] bg-slate-950/70 p-3 backdrop-blur-[2px] sm:p-5"
+          onClick={() => dispatch({ type: 'toggle_debug' })}
+        >
+          <section
+            role="dialog"
+            aria-modal="true"
+            aria-label="Panel de depuración"
+            className="mx-auto flex h-full w-full max-w-5xl flex-col rounded-3xl border border-slate-800 bg-slate-950/95 p-5 text-sm text-slate-300 shadow-2xl shadow-black/40"
+            onClick={(event) => event.stopPropagation()}
+          >
+          <p className="text-[10px] uppercase tracking-[0.35em] text-cyan-400">Debug</p>
+          <div className="mt-4 grid gap-4 overflow-y-auto pr-2 lg:grid-cols-2">
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Operación General</p>
+              <p className="mt-1 font-mono text-cyan-200">Fase: {state.phase}</p>
+              <p className="mt-1 text-xs text-slate-400">Panel Móvil: {state.mobilePanel}</p>
+              <p className="mt-1 text-xs text-slate-400">Roster: {state.travelerIndexInDay + 1} / {TRAVELERS_PER_DAY}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Interacción</p>
+              <p className="mt-1 font-mono text-slate-100">Preguntas: {state.questionsAsked} / {MAX_QUESTIONS}</p>
+              <p className="mt-1 font-mono text-xs text-slate-400">Documento activo: {state.activeDocument ?? 'ninguno'}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Proveedor activo</p>
+              <p className="mt-1 font-mono text-cyan-200">{state.provider_used}</p>
+              <p className="mt-1 text-xs text-slate-400">Modelo texto: {state.text_model_used}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Tipo de inconsistencia</p>
+              <p className="mt-1 font-mono text-slate-100">{state.currentTraveler.internal.inconsistency_type}</p>
+              <p className="mt-1 font-mono text-xs text-slate-400">Caso planeado actual: {getCurrentPlannedCase(state) ?? 'limpio'}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Estado respuesta inicial</p>
+              <p className="mt-1 font-mono text-slate-100">{state.openingReplyStatus}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Fecha inspección</p>
+              <p className="mt-1 font-mono text-slate-100">{state.scenario?.inspectionDate ?? 'sin fecha'}</p>
+            </div>
+          </div>
+          <div className="mt-4 grid gap-4 lg:grid-cols-2">
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Descripción interna</p>
+              <p className="mt-1 text-slate-200">{state.currentTraveler.internal.inconsistency_description}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Prompt de conversación</p>
+              <p className="mt-1 whitespace-pre-wrap rounded-2xl border border-slate-800 bg-slate-900 p-3 font-mono text-xs text-slate-300">
+                {state.currentTraveler.conversation_system_prompt}
+              </p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Audio</p>
+              <p className="mt-1 text-slate-200">{state.audio_enabled ? 'habilitado' : 'deshabilitado'}</p>
+              <p className="mt-1 font-mono text-xs text-slate-400">{state.audio_provider_used ?? 'fish-audio'} · {state.audio_model_used ?? 'sin modelo'}</p>
+            </div>
+            <div>
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Imagen</p>
+              <p className="mt-1 text-slate-200">{state.image_enabled ? state.portrait.status : 'deshabilitada'}</p>
+              <p className="mt-1 font-mono text-xs text-slate-400">{state.image_provider_used ?? 'placeholder'} · {state.image_model_used ?? 'sin modelo'}</p>
+            </div>
+            <div className="lg:col-span-2">
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Casos planificados del día</p>
+              <div className="mt-2 flex flex-col gap-1 rounded-2xl border border-slate-800 bg-slate-900 p-3 font-mono text-xs text-slate-300">
+                {state.currentDayCaseIds.map((caseId, index) => (
+                  <p key={`${caseId ?? 'clean'}-${index}`}>
+                    <span className="text-slate-500">Slot {index + 1}:</span>{' '}
+                    {caseId === null ? 'limpio' : `#${caseId} · ${getById(caseId)?.title ?? 'caso desconocido'}`}
+                  </p>
+                ))}
+              </div>
+            </div>
+            <div className="lg:col-span-2">
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Cola lazy del día</p>
+              <div className="mt-2 grid gap-2 md:grid-cols-2 xl:grid-cols-3">
+                {Array.from({ length: TRAVELERS_PER_DAY }).map((_, index) => {
+                  const traveler = dayRoster[index]?.traveler.profile.name;
+
+                  return (
+                    <div key={`passport-photo-${index}`} className="rounded-2xl border border-slate-800 bg-slate-900 p-3 text-xs text-slate-300">
+                      <p className="font-mono text-cyan-200">Slot {index + 1}</p>
+                      <p className="mt-1 truncate text-slate-400">{traveler ?? 'sin viajero'}</p>
+                      <p className="mt-1 font-mono">Estado: {dayRoster[index] ? 'generado' : 'pendiente'}</p>
+                      <p className="font-mono text-slate-500">{dayRoster[index]?.provider_used ?? 'sin generar'} · {dayRoster[index]?.text_model_used ?? 'sin modelo'}</p>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+            <div className="lg:col-span-2">
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Resultados del día</p>
+              <div className="mt-2 flex flex-col gap-1 rounded-2xl border border-slate-800 bg-slate-900 p-3 font-mono text-xs text-slate-300">
+                {state.dayResults.length > 0 ? state.dayResults.map((result, index) => (
+                  <p key={`${result.traveler_name}-${index}`}>
+                    <span className="text-slate-500">{index + 1}.</span> {result.traveler_name} · {result.was_guilty ? 'culpable' : 'inocente'} · {result.player_decision} · {result.was_correct ? 'correcto' : 'fallo'}
+                  </p>
+                )) : <p className="text-slate-500">Sin resultados todavía.</p>}
+              </div>
+            </div>
+            <div className="lg:col-span-2">
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Histórico excluido (2 días)</p>
+              <div className="mt-2 flex flex-col gap-1 rounded-2xl border border-slate-800 bg-slate-900 p-3 font-mono text-xs text-slate-300">
+                {state.recentCaseIdsByDay.length > 0 ? state.recentCaseIdsByDay.map((caseIds, index) => (
+                  <p key={`recent-day-${index}`}>
+                    <span className="text-slate-500">Día -{state.recentCaseIdsByDay.length - index}:</span>{' '}
+                    {caseIds.length > 0
+                      ? caseIds.map((caseId) => `#${caseId} ${getById(caseId)?.title ?? ''}`.trim()).join(' · ')
+                      : 'sin exclusiones'}
+                  </p>
+                )) : <p className="text-slate-500">Todavía no hay histórico.</p>}
+              </div>
+            </div>
+            <div className="lg:col-span-2">
+              <p className="text-xs uppercase tracking-[0.25em] text-slate-500">Estado del Retrato</p>
+              <div className="mt-2 flex flex-col gap-1">
+                <p className="font-mono text-sm text-slate-200">
+                  <span className="text-slate-500">Activo:</span> <span className="text-cyan-300">{state.portrait.selectedCell}</span> <span className="text-slate-500 text-xs">({state.portrait.selectedExpression} / {state.current_state})</span>
+                </p>
+                <p className="font-mono text-xs text-slate-400">
+                  <span className="text-slate-500">Slots:</span> {state.portrait.expressions.join(' → ')}
+                </p>
+                <p className="font-mono text-xs text-slate-400">
+                          <span className="text-slate-500">Gender:</span> {state.currentTraveler.profile.gender}
+                </p>
+                <p className="font-mono text-xs text-slate-400">
+                  <span className="text-slate-500">Audio sanitizado:</span> {(state.chatHistory.filter((message) => message.role === 'traveler').at(-1)?.audioSanitizedText) ?? 'sin audio'}
+                </p>
+              </div>
+            </div>
+          </div>
+          </section>
+        </div>
+      ) : null}
+      
+      <ResultReveal
+        open={state.phase === 'result'}
+        decision={state.result?.playerDecision ?? null}
+        actual={state.result?.actualDecision ?? null}
+        explanation={state.result?.explanation ?? ''}
+        missedIssue={state.result?.missedIssue ?? null}
+        evidence={state.result?.evidence ?? null}
+        continueLabel={state.travelerIndexInDay + 1 >= TRAVELERS_PER_DAY ? 'Ver noticia del día' : 'Siguiente viajero'}
+        onContinue={() => void handleNextTraveler()}
+      />
+
+      {state.phase === 'briefing' ? (
+        <DayBriefingScreen
+          day={state.day}
+          briefing={state.briefing}
+          disabled={transitionPending}
+          onConfirm={() => void handleStartDay()}
+        />
+      ) : null}
+
+      {state.phase === 'day_news' ? (
+        <NewsScreen
+          day={state.day}
+          nextDay={state.day + 1}
+          news={state.news}
+          performance={getNewsPerformance(state.dayResults)}
+          results={state.dayResults}
+          disabled={transitionPending}
+          onContinue={() => void handleNextDay()}
+        />
+      ) : null}
+
+      {fallbackNotice?.visible ? (
+        <div className="fixed bottom-4 right-4 z-[100] animate-in fade-in slide-in-from-bottom-2 rounded-xl border border-amber-500/20 bg-slate-900/95 px-4 py-3 text-xs font-mono text-amber-200 shadow-xl backdrop-blur-sm">
+          ⚠️ {fallbackNotice.message}
+        </div>
+      ) : null}
+    </main>
+  );
+}

@@ -1,0 +1,14 @@
+services:
+  border-control-game:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: border-control-game
+    restart: unless-stopped
+    env_file:
+      - ./.env.docker
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+    ports:
+      - "127.0.0.1:3000:3000"

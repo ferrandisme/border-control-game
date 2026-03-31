@@ -1,0 +1,137 @@
+"use client";
+
+import { useRef, useEffect, useState } from "react";
+import { motion, AnimatePresence } from "framer-motion";
+
+import { ChatMessage, MAX_QUESTIONS } from "@/lib/game-state";
+
+export interface ChatPanelProps {
+  messages: ChatMessage[];
+  onSendMessage: (text: string) => void;
+  isLoading: boolean;
+  questionsAsked: number;
+  onTakeDecision: () => void;
+  currentState: string;
+  disabled?: boolean;
+}
+
+export function ChatPanel({
+  messages,
+  onSendMessage,
+  isLoading,
+  questionsAsked,
+  onTakeDecision,
+  currentState,
+  disabled = false,
+}: ChatPanelProps) {
+  const [inputValue, setInputValue] = useState("");
+  const endOfMessagesRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    endOfMessagesRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const handleSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!inputValue.trim() || isLoading || disabled || questionsAsked >= MAX_QUESTIONS) return;
+    onSendMessage(inputValue);
+    setInputValue("");
+  };
+
+  return (
+    <div className="flex h-full min-h-[420px] flex-col overflow-hidden rounded-[1.75rem] border border-cyan-950/30 bg-slate-900/95 shadow-2xl lg:min-h-0">
+      <div className="flex items-center justify-between border-b border-cyan-900/20 bg-slate-950 px-4 py-3 shadow-[inset_0_-1px_0_rgba(34,211,238,0.08)]">
+        <h3 className="text-cyan-500 font-mono text-xs uppercase tracking-widest font-bold flex items-center gap-2">
+          <div className="w-2 h-2 rounded-full bg-cyan-500 animate-pulse" />
+          Terminal de Interrogatorio
+        </h3>
+        <div className="text-right">
+          <span className="block text-slate-400 font-mono text-[10px]">Preguntas {questionsAsked}/{MAX_QUESTIONS}</span>
+          <span className="block text-cyan-300 font-mono text-[10px] uppercase tracking-[0.2em]">Estado: {currentState}</span>
+        </div>
+      </div>
+
+      <div className="relative min-h-0 flex-1 overflow-y-auto px-4 py-4 space-y-4 scanline">
+        <AnimatePresence initial={false}>
+          {messages.map((msg) => (
+            <motion.div
+              key={msg.id}
+              initial={{ opacity: 0, y: 10, filter: "blur(4px)" }}
+              animate={{ opacity: 1, y: 0, filter: "blur(0px)" }}
+              className={`flex flex-col max-w-[85%] ${
+                msg.role === "traveler" ? "mr-auto items-start" : 
+                msg.role === "agent" ? "ml-auto items-end" : "mx-auto items-center"
+              }`}
+            >
+              <span className={`text-[10px] font-mono mb-1 px-1 uppercase ${
+                msg.role === "traveler" ? "text-slate-500" :
+                msg.role === "agent" ? "text-cyan-600" : "text-yellow-600"
+              }`}>
+                {msg.role === "traveler" ? "VIAJERO" : msg.role === "agent" ? "AGENTE" : "SISTEMA"}
+              </span>
+              <div
+                className={`px-3 py-2 rounded-lg text-sm font-mono ${
+                  msg.role === "traveler"
+                    ? "border border-slate-700 bg-slate-800/95 text-slate-300"
+                    : msg.role === "agent"
+                    ? "border border-cyan-700/80 bg-cyan-950/50 text-cyan-200 shadow-[0_0_18px_rgba(6,182,212,0.14)] backdrop-blur-sm"
+                    : "border border-yellow-900/50 bg-yellow-950/30 text-center text-xs text-yellow-500"
+                }`}
+              >
+                {msg.content}
+              </div>
+              {msg.audioUrl ? (
+                <audio className="mt-2 h-8 w-full max-w-[280px]" controls preload="none" src={msg.audioUrl} />
+              ) : null}
+            </motion.div>
+          ))}
+        </AnimatePresence>
+        
+        {isLoading && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            className="flex flex-col mr-auto items-start max-w-[85%]"
+          >
+            <span className="text-[10px] font-mono mb-1 px-1 uppercase text-slate-500">
+              VIAJERO
+            </span>
+            <div className="flex h-8 items-center gap-2 rounded-lg border border-cyan-900/20 bg-slate-800/95 px-3 py-2">
+              <div className="h-4 w-2 rounded-sm bg-cyan-500 animate-pulse" />
+              <div className="h-4 w-8 rounded-sm bg-cyan-500/10" />
+            </div>
+          </motion.div>
+        )}
+        <div ref={endOfMessagesRef} />
+      </div>
+
+      <div className="border-t border-cyan-900/20 bg-slate-950 p-4">
+        <form onSubmit={handleSubmit} className="flex gap-2">
+          <input
+            type="text"
+            value={inputValue}
+            onChange={(e) => setInputValue(e.target.value)}
+            disabled={isLoading || disabled || questionsAsked >= MAX_QUESTIONS}
+            placeholder="Interrogar viajero..."
+            className="flex-1 bg-slate-900 border border-slate-700 rounded-md px-3 py-2 text-sm text-cyan-50 font-mono focus:outline-none focus:border-cyan-500 focus:ring-1 focus:ring-cyan-500 disabled:opacity-50"
+          />
+          <button
+            type="submit"
+            disabled={isLoading || disabled || questionsAsked >= MAX_QUESTIONS || !inputValue.trim()}
+            className="bg-cyan-900 hover:bg-cyan-800 disabled:bg-slate-800 disabled:text-slate-600 text-cyan-100 px-4 py-2 rounded-md font-mono text-sm uppercase tracking-wider transition-colors border border-cyan-700 disabled:border-slate-700"
+          >
+            Enviar
+          </button>
+        </form>
+        <button
+          type="button"
+          onClick={onTakeDecision}
+          disabled={disabled || isLoading}
+          className="mt-3 w-full rounded-md border border-slate-700 bg-slate-900 px-4 py-3 text-sm font-semibold uppercase tracking-[0.25em] text-slate-200 transition hover:border-cyan-500 hover:text-cyan-200 disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          Tomar decisión
+        </button>
+      </div>
+    </div>
+  );
+}
